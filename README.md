@@ -1,4 +1,6 @@
-# Bacterial Genomics Analysis Pipeline
+# Bacterial Genomics Analysis Pipeline For a Phylogentic Tree  
+
+*IF genomes are too dissimilar the pipeline will kick them out and will not include them*
 
 A comprehensive pipeline for bacterial comparative genomics, including core genome alignment, recombination detection, and phylogenetic reconstruction.
 
