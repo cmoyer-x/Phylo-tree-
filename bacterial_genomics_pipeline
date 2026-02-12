@@ -1,0 +1,266 @@
+#!/bin/bash
+
+################################################################################
+# Bacterial Genomics Analysis Pipeline
+# Purpose: Core genome alignment, recombination detection, and phylogeny
+# Steps: parsnp -> harvesttools -> gubbins -> mask recombination -> iqtree
+################################################################################
+
+set -e  # Exit on any error
+set -u  # Exit on undefined variables
+set -o pipefail  # Exit if any command in a pipeline fails
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" >&2
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+# Configuration
+REFERENCE="ATCC19977.fasta"
+STRAINS_DIR="AllStrains"
+THREADS=8
+IQTREE_THREADS=4
+CONDA_ENV="analyze_mab"
+
+# Working directory (script will be run from here)
+WORK_DIR=$(pwd)
+
+################################################################################
+# Step 0: Pre-flight checks
+################################################################################
+
+log_info "Starting bacterial genomics pipeline"
+log_info "Working directory: $WORK_DIR"
+
+# Check if reference exists
+if [ ! -f "$REFERENCE" ]; then
+    log_error "Reference file $REFERENCE not found!"
+    exit 1
+fi
+
+# Check if strains directory exists
+if [ ! -d "$STRAINS_DIR" ]; then
+    log_error "Strains directory $STRAINS_DIR not found!"
+    exit 1
+fi
+
+# Count FASTA files
+FASTA_COUNT=$(find "$STRAINS_DIR" -name "*.fasta" -o -name "*.fa" | wc -l)
+log_info "Found $FASTA_COUNT FASTA files in $STRAINS_DIR"
+
+if [ "$FASTA_COUNT" -eq 0 ]; then
+    log_error "No FASTA files found in $STRAINS_DIR"
+    exit 1
+fi
+
+################################################################################
+# Step 1: Activate conda environment
+################################################################################
+
+log_info "Activating conda environment: $CONDA_ENV"
+
+# Source conda
+if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+    source "$HOME/miniconda3/etc/profile.d/conda.sh"
+elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+    source "$HOME/anaconda3/etc/profile.d/conda.sh"
+else
+    log_warn "Conda not found in standard locations. Assuming it's already initialized."
+fi
+
+# Activate environment if conda is available
+if command -v conda &> /dev/null; then
+    conda activate "$CONDA_ENV" || {
+        log_error "Failed to activate conda environment: $CONDA_ENV"
+        exit 1
+    }
+    log_info "Conda environment activated successfully"
+else
+    log_warn "Conda command not found. Proceeding without activation."
+fi
+
+################################################################################
+# Step 2: Run Parsnp for core genome alignment
+################################################################################
+
+log_info "Running Parsnp for core genome alignment..."
+
+parsnp \
+    -r "$REFERENCE" \
+    -d "$STRAINS_DIR"/*.fasta \
+    -p "$THREADS" \
+    --skip-phylogeny \
+    -v \
+    -o "$WORK_DIR/parsnp_output" || {
+    log_error "Parsnp failed!"
+    exit 1
+}
+
+log_info "Parsnp completed successfully"
+
+# Check if parsnp.xmfa was created
+if [ ! -f "$WORK_DIR/parsnp_output/parsnp.xmfa" ]; then
+    log_error "Parsnp output file parsnp.xmfa not found!"
+    exit 1
+fi
+
+################################################################################
+# Step 3: Convert XMFA to FASTA using harvesttools
+################################################################################
+
+log_info "Creating harvesttools directory and converting XMFA to FASTA..."
+
+mkdir -p "$WORK_DIR/harvesttools"
+cd "$WORK_DIR/harvesttools"
+
+harvesttools \
+    -x "$WORK_DIR/parsnp_output/parsnp.xmfa" \
+    -M gubbins_input.fasta || {
+    log_error "Harvesttools conversion failed!"
+    exit 1
+}
+
+# Return to working directory
+cd "$WORK_DIR"
+
+log_info "Harvesttools conversion completed successfully"
+
+# Check if output was created
+if [ ! -f "$WORK_DIR/harvesttools/gubbins_input.fasta" ]; then
+    log_error "Harvesttools output file gubbins_input.fasta not found!"
+    exit 1
+fi
+
+################################################################################
+# Step 4: Run Gubbins for recombination detection
+################################################################################
+
+log_info "Setting up Gubbins analysis..."
+
+mkdir -p "$WORK_DIR/gubbins"
+cp "$WORK_DIR/harvesttools/gubbins_input.fasta" "$WORK_DIR/gubbins/"
+
+cd "$WORK_DIR/gubbins"
+
+log_info "Running Gubbins (this may take a while)..."
+
+run_gubbins.py \
+    gubbins_input.fasta \
+    --threads "$THREADS" \
+    --verbose || {
+    log_error "Gubbins failed!"
+    exit 1
+}
+
+# Return to working directory
+cd "$WORK_DIR"
+
+log_info "Gubbins completed successfully"
+
+# Check if Gubbins outputs were created
+if [ ! -f "$WORK_DIR/gubbins/gubbins_input.recombination_predictions.gff" ]; then
+    log_error "Gubbins recombination predictions GFF not found!"
+    exit 1
+fi
+
+################################################################################
+# Step 5: Mask recombinant regions
+################################################################################
+
+log_info "Masking recombinant regions from alignment..."
+
+cd "$WORK_DIR/gubbins"
+
+# Check if masking script exists
+if [ ! -f "$WORK_DIR/mask_gubbins_aln.py" ]; then
+    log_error "Masking script mask_gubbins_aln.py not found in $WORK_DIR"
+    exit 1
+fi
+
+python3 "$WORK_DIR/mask_gubbins_aln.py" \
+    --aln gubbins_input.fasta \
+    --gff gubbins_input.recombination_predictions.gff \
+    --out masked_fasta_file.fasta || {
+    log_error "Masking recombinant regions failed!"
+    exit 1
+}
+
+# Return to working directory
+cd "$WORK_DIR"
+
+log_info "Recombination masking completed successfully"
+
+# Check if masked file was created
+if [ ! -f "$WORK_DIR/gubbins/masked_fasta_file.fasta" ]; then
+    log_error "Masked FASTA file not found!"
+    exit 1
+fi
+
+################################################################################
+# Step 6: Build phylogenetic tree with IQ-TREE
+################################################################################
+
+log_info "Setting up IQ-TREE analysis..."
+
+mkdir -p "$WORK_DIR/iqtree"
+cp "$WORK_DIR/gubbins/masked_fasta_file.fasta" "$WORK_DIR/iqtree/"
+
+cd "$WORK_DIR/iqtree"
+
+log_info "Running IQ-TREE for phylogenetic reconstruction..."
+
+iqtree \
+    -s masked_fasta_file.fasta \
+    -nt "$IQTREE_THREADS" \
+    -m GTR+G \
+    --verbose || {
+    log_error "IQ-TREE failed!"
+    exit 1
+}
+
+# Return to working directory
+cd "$WORK_DIR"
+
+log_info "IQ-TREE completed successfully"
+
+# Check if tree file was created
+if [ ! -f "$WORK_DIR/iqtree/masked_fasta_file.fasta.treefile" ]; then
+    log_error "IQ-TREE output treefile not found!"
+    exit 1
+fi
+
+################################################################################
+# Step 7: Pipeline completion summary
+################################################################################
+
+log_info "===== PIPELINE COMPLETED SUCCESSFULLY ====="
+log_info ""
+log_info "Output directories and key files:"
+log_info "  1. Parsnp alignment:        $WORK_DIR/parsnp_output/parsnp.xmfa"
+log_info "  2. Converted FASTA:         $WORK_DIR/harvesttools/gubbins_input.fasta"
+log_info "  3. Gubbins recombination:   $WORK_DIR/gubbins/gubbins_input.recombination_predictions.gff"
+log_info "  4. Masked alignment:        $WORK_DIR/gubbins/masked_fasta_file.fasta"
+log_info "  5. Final phylogenetic tree: $WORK_DIR/iqtree/masked_fasta_file.fasta.treefile"
+log_info ""
+log_info "Next steps:"
+log_info "  - Visualize the tree: masked_fasta_file.fasta.treefile"
+log_info "  - Review recombination regions in the GFF file"
+log_info "  - Check IQ-TREE model selection in masked_fasta_file.fasta.iqtree"
+log_info ""
+log_info "Pipeline finished at: $(date '+%Y-%m-%d %H:%M:%S')"
+
+exit 0
